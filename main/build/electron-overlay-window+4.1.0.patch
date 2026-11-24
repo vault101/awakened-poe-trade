@@ -1,5 +1,18 @@
+diff --git a/node_modules/electron-overlay-window/dist/index.d.ts b/node_modules/electron-overlay-window/dist/index.d.ts
+index a49118a..3515dbc 100644
+--- a/node_modules/electron-overlay-window/dist/index.d.ts
++++ b/node_modules/electron-overlay-window/dist/index.d.ts
+@@ -46,6 +46,8 @@ declare class OverlayControllerGlobal {
+     focusTarget(): void;
+     attachByTitle(electronWindow: BrowserWindow | undefined, targetWindowTitle: string, options?: AttachOptions): void;
+     screenshot(): Buffer;
++    copyWithHeldCtrl(): boolean;
++    getHidModifiers(): number;
+ }
+ export declare const OverlayController: OverlayControllerGlobal;
+ export {};
 diff --git a/node_modules/electron-overlay-window/dist/index.js b/node_modules/electron-overlay-window/dist/index.js
-index 98d1d55..68800de 100644
+index 98d1d55..bd1cef9 100644
 --- a/node_modules/electron-overlay-window/dist/index.js
 +++ b/node_modules/electron-overlay-window/dist/index.js
 @@ -69,8 +69,8 @@ class OverlayControllerGlobal {
@@ -27,8 +40,82 @@ index 98d1d55..68800de 100644
              this.electronWindow.focus();
          }
      }
+@@ -232,6 +239,18 @@ class OverlayControllerGlobal {
+         }
+         return lib.screenshot();
+     }
++    copyWithHeldCtrl() {
++        if (!isMac || typeof lib.copyWithHeldCtrl !== 'function') {
++            return false;
++        }
++        return Boolean(lib.copyWithHeldCtrl());
++    }
++    getHidModifiers() {
++        if (!isMac || typeof lib.getHidModifiers !== 'function') {
++            return 0;
++        }
++        return lib.getHidModifiers();
++    }
+ }
+ exports.OverlayController = new OverlayControllerGlobal();
+ //# sourceMappingURL=index.js.map
+\ No newline at end of file
+diff --git a/node_modules/electron-overlay-window/src/lib/addon.c b/node_modules/electron-overlay-window/src/lib/addon.c
+index ff6bbb0..694282d 100644
+--- a/node_modules/electron-overlay-window/src/lib/addon.c
++++ b/node_modules/electron-overlay-window/src/lib/addon.c
+@@ -222,6 +222,32 @@ napi_value AddonScreenshot(napi_env env, napi_callback_info info) {
+   return img_buffer;
+ }
+ 
++napi_value AddonCopyWithHeldCtrl(napi_env env, napi_callback_info info) {
++  napi_status status;
++  napi_value result;
++#ifdef __APPLE__
++  bool sent = ow_copy_with_held_ctrl();
++#else
++  bool sent = false;
++#endif
++  status = napi_get_boolean(env, sent, &result);
++  NAPI_FATAL_IF_FAILED(status, "AddonCopyWithHeldCtrl", "napi_get_boolean");
++  return result;
++}
++
++napi_value AddonGetHidModifiers(napi_env env, napi_callback_info info) {
++  napi_status status;
++  napi_value result;
++#ifdef __APPLE__
++  uint32_t mask = ow_get_hid_modifiers();
++#else
++  uint32_t mask = 0;
++#endif
++  status = napi_create_uint32(env, mask, &result);
++  NAPI_FATAL_IF_FAILED(status, "AddonGetHidModifiers", "napi_create_uint32");
++  return result;
++}
++
+ void AddonCleanUp(void* arg) {
+   // @TODO
+   // UnhookWinEvent(win_event_hhook);
+@@ -251,6 +277,16 @@ NAPI_MODULE_INIT() {
+   status = napi_set_named_property(env, exports, "screenshot", export_fn);
+   NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_set_named_property");
+ 
++  status = napi_create_function(env, NULL, 0, AddonCopyWithHeldCtrl, NULL, &export_fn);
++  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_create_function");
++  status = napi_set_named_property(env, exports, "copyWithHeldCtrl", export_fn);
++  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_set_named_property");
++
++  status = napi_create_function(env, NULL, 0, AddonGetHidModifiers, NULL, &export_fn);
++  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_create_function");
++  status = napi_set_named_property(env, exports, "getHidModifiers", export_fn);
++  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_set_named_property");
++
+   status = napi_add_env_cleanup_hook(env, AddonCleanUp, NULL);
+   NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_add_env_cleanup_hook");
+ 
 diff --git a/node_modules/electron-overlay-window/src/lib/mac.mm b/node_modules/electron-overlay-window/src/lib/mac.mm
-index 9329dfe..605f21e 100644
+index 9329dfe..74b3afe 100644
 --- a/node_modules/electron-overlay-window/src/lib/mac.mm
 +++ b/node_modules/electron-overlay-window/src/lib/mac.mm
 @@ -4,6 +4,7 @@
@@ -139,7 +226,7 @@ index 9329dfe..605f21e 100644
    }
  
    // For the rest of this function, only run if the title matches
-@@ -658,6 +687,7 @@ void ow_focus_target() {
+@@ -658,6 +687,47 @@ void ow_focus_target() {
  
    AXUIElementRef app = AXUIElementCreateApplication(targetInfo.pid);
    AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
@@ -147,3 +234,67 @@ index 9329dfe..605f21e 100644
    AXUIElementRef window = targetInfo.element;
    AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
  }
++
++bool ow_copy_with_held_ctrl() {
++  CGEventFlags hidFlags =
++      CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
++  if ((hidFlags & kCGEventFlagMaskControl) == 0) {
++    return false;
++  }
++
++  CGEventSourceRef src =
++      CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
++  if (!src) {
++    return false;
++  }
++
++  // kVK_ANSI_C = 0x08. Post Ctrl+C without synthesizing a Control keyup
++  // that would clear held modifier state in uiohook / macOS.
++  CGEventRef keyDown = CGEventCreateKeyboardEvent(src, (CGKeyCode)0x08, true);
++  CGEventRef keyUp = CGEventCreateKeyboardEvent(src, (CGKeyCode)0x08, false);
++  if (keyDown && keyUp) {
++    CGEventSetFlags(keyDown, kCGEventFlagMaskControl);
++    CGEventSetFlags(keyUp, kCGEventFlagMaskControl);
++    CGEventPost(kCGHIDEventTap, keyDown);
++    CGEventPost(kCGHIDEventTap, keyUp);
++  }
++  if (keyDown) CFRelease(keyDown);
++  if (keyUp) CFRelease(keyUp);
++  CFRelease(src);
++  return true;
++}
++
++uint32_t ow_get_hid_modifiers() {
++  CGEventFlags hidFlags =
++      CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
++  uint32_t mask = 0;
++  if (hidFlags & kCGEventFlagMaskControl) mask |= 1;
++  if (hidFlags & kCGEventFlagMaskAlternate) mask |= 2;
++  if (hidFlags & kCGEventFlagMaskShift) mask |= 4;
++  if (hidFlags & kCGEventFlagMaskCommand) mask |= 8;
++  return mask;
++}
+diff --git a/node_modules/electron-overlay-window/src/lib/overlay_window.h b/node_modules/electron-overlay-window/src/lib/overlay_window.h
+index 063293d..9156ac3 100644
+--- a/node_modules/electron-overlay-window/src/lib/overlay_window.h
++++ b/node_modules/electron-overlay-window/src/lib/overlay_window.h
+@@ -5,6 +5,7 @@
+ extern "C" {
+ #endif
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ #include <uv.h>
+ 
+@@ -72,6 +73,11 @@ void ow_emit_event(struct ow_event* event);
+ 
+ void ow_screenshot(uint8_t* out, uint32_t width, uint32_t height);
+ 
++#ifdef __APPLE__
++bool ow_copy_with_held_ctrl();
++uint32_t ow_get_hid_modifiers();
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif

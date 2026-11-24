@@ -1,5 +1,6 @@
 import { screen, globalShortcut } from 'electron'
 import { uIOhook, UiohookKey, UiohookWheelEvent } from 'uiohook-napi'
+import { OverlayController } from 'electron-overlay-window'
 import { isModKey, KeyToElectron, mergeTwoHotkeys } from '../../../ipc/KeyToCode'
 import { typeInChat, stashSearch } from './text-box'
 import { WidgetAreaTracker } from '../windowing/WidgetAreaTracker'
@@ -216,6 +217,12 @@ export class Shortcuts {
 function pressKeysToCopyItemText (pressedModKeys: string[] = [], showModsKey: string) {
   // 3.29: Copying an item's text now always copies the advanced description format.
   showModsKey = 'Ctrl'
+
+  if (process.platform === 'darwin' &&
+      pressedModKeys.includes('Ctrl') &&
+      OverlayController.copyWithHeldCtrl()) {
+    return
+  }
 
   let keys = mergeTwoHotkeys('Ctrl + C', showModsKey).split(' + ')
   keys = keys.filter(key => key !== 'C')

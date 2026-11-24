@@ -1,5 +1,6 @@
 import { Rectangle, Point, screen } from 'electron'
 import { uIOhook, UiohookMouseEvent } from 'uiohook-napi'
+import { OverlayController } from 'electron-overlay-window'
 import type { OverlayWindow } from './OverlayWindow'
 import type { ServerEvents } from '../server'
 
@@ -43,7 +44,14 @@ export class WidgetAreaTracker {
   }
 
   private readonly handleMouseMove = (e: UiohookMouseEvent) => {
-    const modifier = e.ctrlKey ? 'Ctrl' : (e.altKey ? 'Alt' : undefined)
+    let modifier = e.ctrlKey ? 'Ctrl' : (e.altKey ? 'Alt' : undefined)
+    if (process.platform === 'darwin' && modifier !== this.holdKey) {
+      const hidMods = OverlayController.getHidModifiers()
+      if ((this.holdKey === 'Ctrl' && (hidMods & 1) !== 0) ||
+          (this.holdKey === 'Alt' && (hidMods & 2) !== 0)) {
+        modifier = this.holdKey
+      }
+    }
     if (!this.overlay.isInteractable && modifier !== this.holdKey) {
       const distance = Math.hypot(e.x - this.from.x, e.y - this.from.y)
       if (distance > this.closeThreshold) {
