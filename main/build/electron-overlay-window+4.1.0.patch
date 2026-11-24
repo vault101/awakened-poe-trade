@@ -1,0 +1,149 @@
+diff --git a/node_modules/electron-overlay-window/dist/index.js b/node_modules/electron-overlay-window/dist/index.js
+index 98d1d55..68800de 100644
+--- a/node_modules/electron-overlay-window/dist/index.js
++++ b/node_modules/electron-overlay-window/dist/index.js
+@@ -69,8 +69,8 @@ class OverlayControllerGlobal {
+         });
+         this.events.on('blur', () => {
+             this.targetHasFocus = false;
+-            if (this.electronWindow && (isMac ||
+-                this.focusNext !== 'overlay' && !this.electronWindow.isFocused())) {
++            if (this.electronWindow && this.focusNext !== 'overlay' &&
++                (isMac || !this.electronWindow.isFocused())) {
+                 this.electronWindow.hide();
+             }
+         });
+@@ -195,6 +195,13 @@ class OverlayControllerGlobal {
+             lib.activateOverlay();
+         }
+         else {
++            if (isMac) {
++                if (!this.electronWindow.isVisible()) {
++                    this.electronWindow.show();
++                    this.electronWindow.setAlwaysOnTop(true, 'screen-saver');
++                }
++                electron_1.app.focus({ steal: true });
++            }
+             this.electronWindow.focus();
+         }
+     }
+diff --git a/node_modules/electron-overlay-window/src/lib/mac.mm b/node_modules/electron-overlay-window/src/lib/mac.mm
+index 9329dfe..605f21e 100644
+--- a/node_modules/electron-overlay-window/src/lib/mac.mm
++++ b/node_modules/electron-overlay-window/src/lib/mac.mm
+@@ -4,6 +4,7 @@
+ #import <ApplicationServices/ApplicationServices.h>
+ #import <Foundation/Foundation.h>
+ #import <array>
++#include <unistd.h>
+ 
+ /**
+  * FORMATTING: This file was formatted automatically with clang-format.
+@@ -135,12 +136,18 @@ static pid_t getFrontmostAppPID() {
+  * https://developer.apple.com/documentation/appkit/nswindow/1419068-windownumber?language=objc
+  */
+ static CGWindowID getWindowID(AXUIElementRef window) {
++  if (!window) {
++    return 0;
++  }
+   CGWindowID windowID = 0;
+   _AXUIElementGetWindow(window, &windowID);
+   return windowID;
+ }
+ 
+ static NSString *getTitleForWindow(AXUIElementRef window) {
++  if (!window) {
++    return NULL;
++  }
+   CFStringRef cfTitle = NULL;
+   AXError error = AXUIElementCopyAttributeValue(window, kAXTitleAttribute,
+                                                 (CFTypeRef *)&cfTitle);
+@@ -243,7 +250,8 @@ static void maybeEmitMoveResizeEvent(CGWindowID windowID) {
+  */
+ static void handleFocusMaybeChanged() {
+   pid_t frontmostPID = getFrontmostAppPID();
+-  AXUIElementRef frontmostWindow = copyFrontmostWindow(frontmostPID);
++  AXUIElementRef frontmostWindow =
++      (frontmostPID == getpid()) ? NULL : copyFrontmostWindow(frontmostPID);
+ 
+   checkAndHandleWindow(frontmostPID, frontmostWindow);
+ 
+@@ -447,24 +455,33 @@ static void pollForWindowChanges() {
+  * Called with the frontmost window and its PID.
+  */
+ static void checkAndHandleWindow(pid_t pid, AXUIElementRef frontmostWindow) {
++  pid_t selfPID = getpid();
++  bool ownAppFocused = (pid == selfPID);
++  bool wasOwnAppFocused = (frontmostInfo.pid == selfPID);
++
+   CGWindowID frontmostWindowID = getWindowID(frontmostWindow);
+   CGWindowID targetWindowID = getWindowID(targetInfo.element);
+   CGWindowID overlayWindowID =
+       overlayInfo.window ? (CGWindowID)[overlayInfo.window windowNumber] : 0;
+ 
+-  // Emit blur/detach/focus if the frontmost window has changed
+-  // We count the target as focused even if the overlay is focused, since
+-  // we don't want to hide the overlay when the user is using it
++  // Emit blur/detach/focus if the frontmost window has changed.
++  // Count the target as focused whenever our own process is frontmost
++  // (including the overlay and any child window/sheet/panel such as
++  // NSOpenPanel or popup menus) so we never hide the overlay while using it.
+   bool targetFocused =
+-      frontmostWindowID != 0 && targetWindowID == frontmostWindowID;
++      !ownAppFocused && frontmostWindowID != 0 &&
++      targetWindowID == frontmostWindowID;
++  bool overlayFocused =
++      ownAppFocused ||
++      (frontmostWindowID != 0 && frontmostWindowID == overlayWindowID);
+ 
+-  if (targetFocused && !targetInfo.isFocused) {
++  if (targetFocused && (!targetInfo.isFocused || wasOwnAppFocused)) {
+     targetInfo.isFocused = true;
+     struct ow_event e = {.type = OW_FOCUS};
+     // NSLog(@"checkAndHandleWindow: focus");
+     ow_emit_event(&e);
+   } else if (!targetFocused && targetInfo.isFocused) {
+-    if (targetInfo.isDestroyed || frontmostWindowID != overlayWindowID) {
++    if (targetInfo.isDestroyed || !overlayFocused) {
+       targetInfo.isFocused = false;
+       struct ow_event e = {.type = OW_BLUR};
+       // NSLog(@"checkAndHandleWindow: blur");
+@@ -494,13 +511,25 @@ static void checkAndHandleWindow(pid_t pid, AXUIElementRef frontmostWindow) {
+ 
+   frontmostInfo.windowID = frontmostWindowID;
+   // Ensure that the window focus/blur observers are attached to the foreground
+-  // window at all times
++  // window at all times. Skip attaching an AXObserver to our own process to
++  // avoid self-AX IPC stalls; NSWorkspaceDidActivateApplicationNotification
++  // notifies us as soon as another app activates.
+   if (pid != frontmostInfo.pid) {
+     frontmostInfo.pid = pid;
+-    AXUIElementRef application = AXUIElementCreateApplication(pid);
+-    updateWindowInfo(pid, application, frontmostInfo, appFocusNotificationTypes,
+-                     /* isTargetWindow */ false);
+-    pollForWindowChanges();
++    if (ownAppFocused) {
++      clearWindowInfo(frontmostInfo, appFocusNotificationTypes);
++    } else {
++      AXUIElementRef application = AXUIElementCreateApplication(pid);
++      updateWindowInfo(pid, application, frontmostInfo,
++                       appFocusNotificationTypes,
++                       /* isTargetWindow */ false);
++      CFRelease(application);
++      pollForWindowChanges();
++    }
++  }
++
++  if (ownAppFocused || !frontmostWindow) {
++    return;
+   }
+ 
+   // For the rest of this function, only run if the title matches
+@@ -658,6 +687,7 @@ void ow_focus_target() {
+ 
+   AXUIElementRef app = AXUIElementCreateApplication(targetInfo.pid);
+   AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
++  CFRelease(app);
+   AXUIElementRef window = targetInfo.element;
+   AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
+ }

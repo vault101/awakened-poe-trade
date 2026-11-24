@@ -77,6 +77,9 @@ export default defineComponent({
       nextTick(() => { saveConfig() })
     })
     window.addEventListener('focus', () => {
+      if (active.value && topmostOrExclusiveWidget.value.wmType !== 'settings') {
+        showEditingNotification.value = false
+      }
       Host.sendEvent({
         name: 'CLIENT->MAIN::used-recently',
         payload: { isOverlay: Host.isElectron }
